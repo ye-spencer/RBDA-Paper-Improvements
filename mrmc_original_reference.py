@@ -2,6 +2,8 @@
 MRMC: Maximum Reduction as Maximum Contribution
 Core-set Selection for Deep Learning Through Squared Loss Minimization
 
+Reference Version Created Through AI - Not Validated
+
 Implementation of Algorithm 1 from:
 "Efficient Core-set Selection for Deep Learning Through Squared Loss Minimization"
 Jianting Chen, ICML 2025
