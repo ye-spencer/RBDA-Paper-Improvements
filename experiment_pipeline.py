@@ -13,6 +13,7 @@ from models import WineMLP
 import torch.nn as nn
 import torch.optim as optim
 from coreset_selection import RandomCoresetSelection, FullDatasetSelection, MRMCOriginalCoresetSelection, MRMCAdaptiveCoresetSelection
+import time
 
 
 def train_model(model, criterion, optimizer, train_loader, epochs, device):
@@ -132,7 +133,10 @@ def main():
 
         print(f"\n {coreset_selector.__class__.__name__} Coreset: ")
 
+        start_time = time.time()
         coreset_indices = coreset_selector.select_coreset(train_dataset)
+        end_time = time.time()
+        print(f"Coreset selection time: {end_time - start_time:.4f} seconds")
 
         train_subset = torch.utils.data.Subset(train_dataset, coreset_indices)
 
