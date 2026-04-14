@@ -8,10 +8,60 @@ from sklearn.preprocessing import StandardScaler
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 from models import WineMLP
+import torch.nn as nn
+import torch.optim as optim
 
 
-def train_model(model, X_train, y_train, epochs, lr, batch_size, device):
-    pass
+def train_model(model, criterion, optimizer, train_loader, epochs, batch_size, device):
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0
+        correct = 0
+        total = 0
+
+        for features, labels in train_loader:
+            # features, labels = features.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(features)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            predicted = torch.argmax(outputs, dim=1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+        epoch_loss = running_loss / len(train_loader)
+        epoch_acc = correct / total
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
+
+
+def evaluate_model(model, criterion, test_loader, device):
+    model.eval()
+    running_loss = 0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for features, labels in test_loader:
+            # features, labels = features.to(device), labels.to(device)
+
+            outputs = model(features)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item()
+            predicted = torch.argmax(outputs, dim=1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    epoch_loss = running_loss / len(test_loader)
+    epoch_acc = correct / total
+
+    print(f"Test Loss: {epoch_loss:.4f}, Test Accuracy: {epoch_acc:.4f}")
+        
     
 def main():
 
@@ -25,7 +75,7 @@ def main():
     print("\n Wine dataset loaded: ---")
     print(f"Features shape: {X.shape}")  # (178, 13)
     print(f"Labels shape:   {y.shape}")  # (178,)
-    print(f"Classes:        {set(y)}")   # {0, 1, 2}
+    print(f"Classes:        {set(y)}\n")   # {0, 1, 2}
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=0, stratify=y)
 
@@ -45,11 +95,18 @@ def main():
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
     model = WineMLP()
-    print(model)
 
-    # Count parameters to get a feel for the model's size
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"\nTotal parameters: {num_params}")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+
+    train_model(model, criterion, optimizer, train_loader, epochs, batch_size, device)
+
+    evaluate_model(model, criterion, test_loader, device)
+
+
+
+    
 
 
 if __name__ == "__main__":
