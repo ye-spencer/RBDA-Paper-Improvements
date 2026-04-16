@@ -4,7 +4,7 @@ Testing Pipeline
 For different experiments, we select different datasets (and select the best hyperparameters for each dataset). Then, we compare the accuracy of different coreset selection methods, including random (bottom baseline), original MRMC (control), adaptive MRMC (improvement), and full dataset (top baseline).
 
 """
-from sklearn.datasets import load_digits
+from sklearn.datasets import load_digits, fetch_openml
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
@@ -14,6 +14,21 @@ import torch.nn as nn
 import torch.optim as optim
 from coreset_selection import RandomCoresetSelection, FullDatasetSelection, MRMCOriginalCoresetSelection, MRMCAdaptiveCoresetSelection
 import time
+
+
+def load_dataset(name):
+    """
+    Returns (X_raw, y_raw) as numpy arrays.
+    Supported: 'digits', 'mnist'
+    """
+    if name == 'digits':
+        X, y = load_digits(return_X_y=True)
+    elif name == 'mnist':
+        mnist = fetch_openml('mnist_784', version=1, as_frame=False, parser='liac-arff')
+        X, y = mnist.data, mnist.target.astype(int)
+    else:
+        raise ValueError(f"Unknown dataset: {name}")
+    return X, y
 
 
 def train_model(model, criterion, optimizer, train_loader, epochs, device):
@@ -80,7 +95,8 @@ def main():
     ### --- End Find Best Normal ML Hyperparameters for Dataset --- ###
 
     ### Pick Dataset ###
-    X_raw, y_raw = load_digits(return_X_y=True)
+    DATASET = 'mnist'   # 'digits' | 'mnist'
+    X_raw, y_raw = load_dataset(DATASET)
     num_features = X_raw.shape[1]
     num_classes = len(set(y_raw))
     print("\n Dataset loaded: ---")
