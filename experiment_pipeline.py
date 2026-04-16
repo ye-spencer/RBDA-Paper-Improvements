@@ -4,7 +4,7 @@ Testing Pipeline
 For different experiments, we select different datasets (and select the best hyperparameters for each dataset). Then, we compare the accuracy of different coreset selection methods, including random (bottom baseline), original MRMC (control), adaptive MRMC (improvement), and full dataset (top baseline).
 
 """
-from sklearn.datasets import load_digits, fetch_openml
+from sklearn.datasets import load_digits, fetch_openml, fetch_covtype
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import torch
@@ -26,6 +26,9 @@ def load_dataset(name):
     elif name == 'mnist':
         mnist = fetch_openml('mnist_784', version=1, as_frame=False, parser='liac-arff')
         X, y = mnist.data, mnist.target.astype(int)
+    elif name == 'covtype':
+        data = fetch_covtype()
+        X, y = data.data, (data.target - 1).astype(int)  # labels are 1-7, shift to 0-6
     else:
         raise ValueError(f"Unknown dataset: {name}")
     return X, y
@@ -95,7 +98,7 @@ def main():
     ### --- End Find Best Normal ML Hyperparameters for Dataset --- ###
 
     ### Pick Dataset ###
-    DATASET = 'mnist'   # 'digits' | 'mnist'
+    DATASET = 'covtype'   # 'digits' | 'mnist' | 'covtype'
     X_raw, y_raw = load_dataset(DATASET)
     num_features = X_raw.shape[1]
     num_classes = len(set(y_raw))
@@ -126,12 +129,12 @@ def main():
     ### --- EXPERIMENT VARIATIONS --- ###
 
     # MRMC Hyperparameters
-    R = 20
+    R = 6
     rho = 0.5
     gamma = 2.0
 
     # Coreset Fraction
-    coreset_fraction = 0.3
+    coreset_fraction = 0.1
 
     # Model Function
     generate_model_func = lambda features=num_features, num_classes=num_classes: WineMLP(features, num_classes)
