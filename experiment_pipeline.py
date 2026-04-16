@@ -124,9 +124,15 @@ def main():
 
     CORESET_SELECTION = [
         RandomCoresetSelection(coreset_fraction),
-        # MRMCOriginalCoresetSelection(coreset_fraction, R, rho, gamma, generate_model_func, device),
+        FullDatasetSelection(),
+        MRMCOriginalCoresetSelection(
+            coreset_fraction, R, rho, gamma,
+            model_fn=generate_model_func,
+            device=device,
+            penultimate_layer_name='fc2',
+            num_classes=num_classes,
+        ),
         # MRMCAdaptiveCoresetSelection(coreset_fraction, R, rho, gamma, generate_model_func, device),
-        FullDatasetSelection()
     ]
 
     for coreset_selector in CORESET_SELECTION:
