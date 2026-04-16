@@ -12,7 +12,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from models import WineMLP
 import torch.nn as nn
 import torch.optim as optim
-from coreset_selection import RandomCoresetSelection, FullDatasetSelection, MRMCOriginalCoresetSelection, MRMCAdaptiveCoresetSelection
+from coreset_selection import RandomCoresetSelection, FullDatasetSelection, MRMCOriginalCoresetSelection, MRMCOriginalStratifiedCoresetSelection, MRMCAdaptiveCoresetSelection
 import time
 
 
@@ -145,6 +145,13 @@ def main():
         RandomCoresetSelection(coreset_fraction),
         FullDatasetSelection(),
         MRMCOriginalCoresetSelection(
+            coreset_fraction, R, rho, gamma,
+            model_fn=generate_model_func,
+            device=device,
+            penultimate_layer_name='fc2',
+            num_classes=num_classes,
+        ),
+        MRMCOriginalStratifiedCoresetSelection(
             coreset_fraction, R, rho, gamma,
             model_fn=generate_model_func,
             device=device,

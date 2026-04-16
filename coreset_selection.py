@@ -122,6 +122,20 @@ def _train_proxy(features, labels, num_classes, device, lr=0.01, epochs=10):
     return proxy
 
 
+def _stratified_top_k(scores, labels, k):
+    """Select k indices preserving the class distribution of the full dataset."""
+    indices = []
+    classes, counts = np.unique(labels, return_counts=True)
+    class_quota = np.round((counts / len(labels)) * k).astype(int)
+    diff = k - class_quota.sum()
+    class_quota[np.argmax(counts)] += diff
+    for cls, quota in zip(classes, class_quota):
+        cls_idx = np.where(labels == cls)[0]
+        top = cls_idx[np.argsort(scores[cls_idx])[::-1][:quota]]
+        indices.extend(top.tolist())
+    return indices
+
+
 def _run_mrmc_selection(
     model_fn,
     dataset,
@@ -134,6 +148,7 @@ def _run_mrmc_selection(
     penultimate_layer_name,
     batch_size,
     lr,
+    stratified=False,
 ):
     """Core MRMC selection logic (Algorithm 1), adapted for tabular data."""
     N = len(dataset)
@@ -172,17 +187,28 @@ def _run_mrmc_selection(
     print("Computing MRMC scores...")
     mrmc_scores = _fit_mrmc_scores(loss_sequences)
 
+    all_labels_np = dataset.tensors[1].numpy()
+
+    def _select(scores, indices, k):
+        if stratified:
+            return _stratified_top_k(scores, all_labels_np[indices], k)
+        return np.argsort(scores)[::-1][:k].tolist()
+
     # --- Phase 3: pure MRMC (rho=1) ---
-    sorted_by_mrmc = np.argsort(mrmc_scores)[::-1]
     if rho >= 1.0:
-        return sorted_by_mrmc[:coreset_size].tolist()
+        all_indices = np.arange(N)
+        selected = _select(mrmc_scores, all_indices, coreset_size)
+        return [int(all_indices[i]) for i in selected] if stratified else [int(i) for i in np.argsort(mrmc_scores)[::-1][:coreset_size]]
 
     # --- Phase 4: MRMC-R (regularized) ---
     initial_size = max(1, int(round(rho * coreset_size)))
     remaining_size = coreset_size - initial_size
 
-    c_prime_indices = sorted_by_mrmc[:initial_size].tolist()
-    remaining_pool = sorted_by_mrmc[initial_size:].tolist()
+    all_indices = np.arange(N)
+    c_prime_local = _select(mrmc_scores, all_indices, initial_size)
+    c_prime_indices = [int(all_indices[i]) for i in c_prime_local] if stratified else [int(i) for i in np.argsort(mrmc_scores)[::-1][:initial_size]]
+    c_prime_set = set(c_prime_indices)
+    remaining_pool = [i for i in range(N) if i not in c_prime_set]
 
     print("Extracting features for proxy model...")
     all_features, all_labels = _extract_features(model, ordered_loader, device, penultimate_layer_name)
@@ -207,9 +233,10 @@ def _run_mrmc_selection(
             reg_losses.extend(ce(proxy(feat), lab).cpu().numpy())
     reg_scores = np.exp(-np.array(reg_losses))
 
-    combined = mrmc_scores[remaining_pool] - gamma * reg_scores
-    top_remaining_local = np.argsort(combined)[::-1][:remaining_size]
-    top_remaining = [remaining_pool[k] for k in top_remaining_local]
+    pool_indices = np.array(remaining_pool)
+    combined = mrmc_scores[pool_indices] - gamma * reg_scores
+    top_local = _select(combined, pool_indices, remaining_size)
+    top_remaining = [int(pool_indices[i]) for i in top_local] if stratified else [int(pool_indices[i]) for i in np.argsort(combined)[::-1][:remaining_size]]
 
     return c_prime_indices + top_remaining
 
@@ -258,6 +285,46 @@ class MRMCOriginalCoresetSelection(CoresetSelection):
             penultimate_layer_name=self.penultimate_layer_name,
             batch_size=self.batch_size,
             lr=self.lr,
+        )
+
+
+class MRMCOriginalStratifiedCoresetSelection(CoresetSelection):
+    """
+    MRMC coreset selection with stratified top-k selection.
+    Preserves the original class distribution in the coreset, which prevents
+    class-imbalanced datasets from producing a biased selection.
+    """
+    def __init__(self, coreset_fraction, R, rho, gamma, model_fn, device,
+                 penultimate_layer_name=None, batch_size=64, lr=0.001, num_classes=None):
+        super().__init__(coreset_fraction)
+        self.R = R
+        self.rho = rho
+        self.gamma = gamma
+        self.model_fn = model_fn
+        self.device = device
+        self.penultimate_layer_name = penultimate_layer_name
+        self.batch_size = batch_size
+        self.lr = lr
+        self.num_classes = num_classes
+
+    def select_coreset(self, dataset):
+        coreset_size = int(self.coreset_fraction * len(dataset))
+        num_classes = self.num_classes
+        if num_classes is None:
+            num_classes = int(dataset.tensors[1].max().item()) + 1
+        return _run_mrmc_selection(
+            model_fn=self.model_fn,
+            dataset=dataset,
+            coreset_size=coreset_size,
+            device=self.device,
+            R=self.R,
+            rho=self.rho,
+            gamma=self.gamma,
+            num_classes=num_classes,
+            penultimate_layer_name=self.penultimate_layer_name,
+            batch_size=self.batch_size,
+            lr=self.lr,
+            stratified=True,
         )
 
 
