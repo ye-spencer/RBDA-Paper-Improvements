@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from scipy.optimize import curve_fit
+from sklearn.cluster import MiniBatchKMeans
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ def _fit_mrmc_scores(loss_sequences):
     N, R = loss_sequences.shape
     epochs = np.arange(1, R + 1, dtype=float)
     scores = np.zeros(N, dtype=float)
-    for i in range(N):
+    for i in tqdm(range(N), desc="Computing MRMC scores", unit="sample"):
         L = loss_sequences[i]
         try:
             p0 = [max(L[0], 1e-6), max(1.01, L[0] / max(L[-1], 1e-9))]
@@ -184,7 +186,6 @@ def _run_mrmc_selection(
         print(f"  Warm-up epoch {r+1}/{R}  mean_loss={loss_sequences[:, r].mean():.4f}")
 
     # --- Phase 2: MRMC scores ---
-    print("Computing MRMC scores...")
     mrmc_scores = _fit_mrmc_scores(loss_sequences)
 
     all_labels_np = dataset.tensors[1].numpy()
@@ -325,6 +326,102 @@ class MRMCOriginalStratifiedCoresetSelection(CoresetSelection):
             batch_size=self.batch_size,
             lr=self.lr,
             stratified=True,
+        )
+
+
+def _run_mrmc_kmeans_selection(
+    model_fn, dataset, coreset_size, device,
+    R, penultimate_layer_name, batch_size, lr,
+):
+    N = len(dataset)
+    model = model_fn()
+    model.to(device)
+
+    criterion = nn.CrossEntropyLoss(reduction='none')
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    ordered_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    loss_sequences = np.zeros((N, R), dtype=np.float32)
+
+    for r in range(R):
+        model.train()
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            criterion(model(inputs), labels).mean().backward()
+            optimizer.step()
+
+        model.eval()
+        idx = 0
+        with torch.no_grad():
+            for inputs, labels in ordered_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                losses = criterion(model(inputs), labels).cpu().numpy()
+                loss_sequences[idx:idx + len(losses), r] = losses
+                idx += len(losses)
+        print(f"  Warm-up epoch {r+1}/{R}  mean_loss={loss_sequences[:, r].mean():.4f}")
+
+    mrmc_scores = _fit_mrmc_scores(loss_sequences)
+
+    print("Extracting features for K-Means clustering...")
+    all_features, _ = _extract_features(model, ordered_loader, device, penultimate_layer_name)
+    all_features_np = all_features.numpy()
+    all_labels_np = dataset.tensors[1].numpy()
+
+    classes, counts = np.unique(all_labels_np, return_counts=True)
+    class_quota = np.round((counts / N) * coreset_size).astype(int)
+    class_quota[np.argmax(counts)] += coreset_size - class_quota.sum()
+
+    selected = []
+    for cls, quota in tqdm(zip(classes, class_quota), total=len(classes), desc="K-Means per class"):
+        cls_indices = np.where(all_labels_np == cls)[0]
+        cls_features = all_features_np[cls_indices]
+        cls_scores = mrmc_scores[cls_indices]
+
+        km = MiniBatchKMeans(n_clusters=quota, random_state=0,
+                             batch_size=min(10_000, len(cls_indices)), n_init=3)
+        cluster_ids = km.fit_predict(cls_features)
+
+        for c in range(quota):
+            mask = cluster_ids == c
+            if not mask.any():
+                continue
+            best_local = int(np.argmax(cls_scores[mask]))
+            selected.append(int(cls_indices[np.where(mask)[0][best_local]]))
+
+    return selected
+
+
+class MRMCKMeansCoresetSelection(CoresetSelection):
+    """
+    MRMC + K-Means diversity coreset selection.
+
+    Clusters each class's feature space into K groups (MiniBatchKMeans on
+    penultimate-layer features), then picks the highest-MRMC sample per cluster.
+    This combines spatial coverage with informativeness, fixing the redundancy
+    problem of vanilla MRMC where hard samples cluster near the same boundaries.
+    """
+    def __init__(self, coreset_fraction, R, model_fn, device,
+                 penultimate_layer_name=None, batch_size=64, lr=0.001):
+        super().__init__(coreset_fraction)
+        self.R = R
+        self.model_fn = model_fn
+        self.device = device
+        self.penultimate_layer_name = penultimate_layer_name
+        self.batch_size = batch_size
+        self.lr = lr
+
+    def select_coreset(self, dataset):
+        coreset_size = int(self.coreset_fraction * len(dataset))
+        return _run_mrmc_kmeans_selection(
+            model_fn=self.model_fn,
+            dataset=dataset,
+            coreset_size=coreset_size,
+            device=self.device,
+            R=self.R,
+            penultimate_layer_name=self.penultimate_layer_name,
+            batch_size=self.batch_size,
+            lr=self.lr,
         )
 
 
