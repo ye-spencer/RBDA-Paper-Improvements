@@ -37,12 +37,13 @@ class FullDatasetSelection(CoresetSelection):
 
 
 class RandomCoresetSelection(CoresetSelection):
-    def __init__(self, coreset_fraction):
+    def __init__(self, coreset_fraction, seed=0):
         super().__init__(coreset_fraction)
+        self.seed = seed
 
     def select_coreset(self, dataset):
-        np.random.seed(0)
-        return np.random.choice(
+        rng = np.random.default_rng(self.seed)
+        return rng.choice(
             len(dataset), int(self.coreset_fraction * len(dataset)), replace=False
         ).tolist()
 
@@ -296,7 +297,8 @@ def _run_mrmc_selection(
     if rho >= 1.0:
         all_indices = np.arange(N)
         selected = _select(mrmc_scores, all_indices, coreset_size)
-        return [int(all_indices[i]) for i in selected] if stratified else [int(i) for i in np.argsort(mrmc_scores)[::-1][:coreset_size]]
+        indices = [int(all_indices[i]) for i in selected] if stratified else [int(i) for i in np.argsort(mrmc_scores)[::-1][:coreset_size]]
+        return indices, mrmc_scores
 
     # --- Phase 4: MRMC-R (regularized) ---
     initial_size = max(1, int(round(rho * coreset_size)))
@@ -336,7 +338,7 @@ def _run_mrmc_selection(
     top_local = _select(combined, pool_indices, remaining_size)
     top_remaining = [int(pool_indices[i]) for i in top_local] if stratified else [int(pool_indices[i]) for i in np.argsort(combined)[::-1][:remaining_size]]
 
-    return c_prime_indices + top_remaining
+    return c_prime_indices + top_remaining, mrmc_scores
 
 
 # ---------------------------------------------------------------------------
@@ -371,7 +373,7 @@ class MRMCOriginalCoresetSelection(CoresetSelection):
         if num_classes is None:
             # infer from TensorDataset labels
             num_classes = int(dataset.tensors[1].max().item()) + 1
-        return _run_mrmc_selection(
+        indices, mrmc_scores = _run_mrmc_selection(
             model_fn=self.model_fn,
             dataset=dataset,
             coreset_size=coreset_size,
@@ -384,6 +386,8 @@ class MRMCOriginalCoresetSelection(CoresetSelection):
             batch_size=self.batch_size,
             lr=self.lr,
         )
+        self.last_scores = mrmc_scores
+        return indices
 
 
 class MRMCOriginalStratifiedCoresetSelection(CoresetSelection):
@@ -410,7 +414,7 @@ class MRMCOriginalStratifiedCoresetSelection(CoresetSelection):
         num_classes = self.num_classes
         if num_classes is None:
             num_classes = int(dataset.tensors[1].max().item()) + 1
-        return _run_mrmc_selection(
+        indices, mrmc_scores = _run_mrmc_selection(
             model_fn=self.model_fn,
             dataset=dataset,
             coreset_size=coreset_size,
@@ -424,6 +428,8 @@ class MRMCOriginalStratifiedCoresetSelection(CoresetSelection):
             lr=self.lr,
             stratified=True,
         )
+        self.last_scores = mrmc_scores
+        return indices
 
 
 def _run_mrmc_kmeans_selection(
@@ -504,7 +510,7 @@ def _run_mrmc_kmeans_selection(
                 best_local = int(np.argmax(blended))
             selected.append(int(cls_indices[member_indices[best_local]]))
 
-    return selected
+    return selected, mrmc_scores
 
 
 class MRMCKMeansCoresetSelection(CoresetSelection):
@@ -528,7 +534,7 @@ class MRMCKMeansCoresetSelection(CoresetSelection):
 
     def select_coreset(self, dataset):
         coreset_size = int(self.coreset_fraction * len(dataset))
-        return _run_mrmc_kmeans_selection(
+        indices, mrmc_scores = _run_mrmc_kmeans_selection(
             model_fn=self.model_fn,
             dataset=dataset,
             coreset_size=coreset_size,
@@ -538,6 +544,8 @@ class MRMCKMeansCoresetSelection(CoresetSelection):
             batch_size=self.batch_size,
             lr=self.lr,
         )
+        self.last_scores = mrmc_scores
+        return indices
 
 
 class MRMCKMeansNormalizedCoresetSelection(CoresetSelection):
@@ -561,7 +569,7 @@ class MRMCKMeansNormalizedCoresetSelection(CoresetSelection):
 
     def select_coreset(self, dataset):
         coreset_size = int(self.coreset_fraction * len(dataset))
-        return _run_mrmc_kmeans_selection(
+        indices, mrmc_scores = _run_mrmc_kmeans_selection(
             model_fn=self.model_fn,
             dataset=dataset,
             coreset_size=coreset_size,
@@ -572,6 +580,8 @@ class MRMCKMeansNormalizedCoresetSelection(CoresetSelection):
             lr=self.lr,
             normalize_features=True,
         )
+        self.last_scores = mrmc_scores
+        return indices
 
 
 class MRMCKMeansBlendedCoresetSelection(CoresetSelection):
@@ -605,7 +615,7 @@ class MRMCKMeansBlendedCoresetSelection(CoresetSelection):
 
     def select_coreset(self, dataset):
         coreset_size = int(self.coreset_fraction * len(dataset))
-        return _run_mrmc_kmeans_selection(
+        indices, mrmc_scores = _run_mrmc_kmeans_selection(
             model_fn=self.model_fn,
             dataset=dataset,
             coreset_size=coreset_size,
@@ -617,6 +627,8 @@ class MRMCKMeansBlendedCoresetSelection(CoresetSelection):
             normalize_features=self.normalize_features,
             alpha=self.alpha,
         )
+        self.last_scores = mrmc_scores
+        return indices
 
 
 class MRMCScoreStratifiedCoresetSelection(CoresetSelection):
@@ -682,6 +694,7 @@ class MRMCScoreStratifiedCoresetSelection(CoresetSelection):
             print(f"  Warm-up epoch {r+1}/{self.R}  mean_loss={loss_sequences[:, r].mean():.4f}")
 
         mrmc_scores = _fit_mrmc_scores(loss_sequences)
+        self.last_scores = mrmc_scores
         all_labels_np = dataset.tensors[1].numpy()
 
         rng = np.random.default_rng(self.seed)
