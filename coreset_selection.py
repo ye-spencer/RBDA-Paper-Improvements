@@ -138,6 +138,103 @@ def _stratified_top_k(scores, labels, k):
     return indices
 
 
+def _score_stratified_select(
+    scores,
+    labels,
+    k,
+    num_bins=5,
+    prune_bottom=0.1,
+    prune_top=0.0,
+    per_class=True,
+    rng=None,
+):
+    """
+    CCS-style score-stratified coreset selection.
+
+    Bins MRMC scores into equal-population strata and samples uniformly from
+    each stratum. This fixes the pathology where pure top-k concentrates on
+    the hardest samples (often noisy/ambiguous) and ignores the easy
+    distribution — a known failure mode at aggressive pruning ratios.
+
+    Args:
+        scores:        (N,) MRMC (or any) importance score, higher = harder.
+        labels:        (N,) class labels, used when per_class=True.
+        k:             total coreset size.
+        num_bins:      number of equal-population score bins.
+        prune_bottom:  drop this fraction of lowest-score samples before
+                       binning (trivial/easy samples the model already got).
+        prune_top:     drop this fraction of highest-score samples before
+                       binning (typically noisy / mislabeled outliers).
+        per_class:     if True, bin within each class independently, so class
+                       balance is preserved alongside score coverage.
+        rng:           np.random.Generator (seeded for reproducibility).
+    Returns:
+        list[int] of selected indices.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    def _stratify_pool(pool_idx, quota):
+        """Bin pool_idx by score quantile, sample `quota` uniformly across bins."""
+        if quota <= 0 or len(pool_idx) == 0:
+            return []
+        pool_scores = scores[pool_idx]
+        # prune low/high score tails
+        order = np.argsort(pool_scores)
+        lo = int(prune_bottom * len(order))
+        hi = len(order) - int(prune_top * len(order))
+        kept_local = order[lo:hi]
+        kept_idx = pool_idx[kept_local]
+        kept_scores = pool_scores[kept_local]
+        if len(kept_idx) <= quota:
+            return kept_idx.tolist()
+
+        # equal-population bins via quantiles
+        B = min(num_bins, len(kept_idx))
+        quantiles = np.quantile(kept_scores, np.linspace(0, 1, B + 1))
+        quantiles[-1] += 1e-9  # include top edge
+        bin_assign = np.digitize(kept_scores, quantiles[1:-1])
+
+        # allocate quota evenly across bins, remainder → random bins
+        base = quota // B
+        remainder = quota - base * B
+        per_bin = np.full(B, base, dtype=int)
+        if remainder:
+            per_bin[rng.choice(B, size=remainder, replace=False)] += 1
+
+        chosen = []
+        leftover = 0
+        for b in range(B):
+            members = np.where(bin_assign == b)[0]
+            want = per_bin[b] + leftover
+            if len(members) <= want:
+                chosen.extend(kept_idx[members].tolist())
+                leftover = want - len(members)
+            else:
+                pick = rng.choice(members, size=want, replace=False)
+                chosen.extend(kept_idx[pick].tolist())
+                leftover = 0
+        # if we still owe samples (bins ran thin), fill from remaining kept pool
+        if len(chosen) < quota:
+            remaining = np.setdiff1d(kept_idx, np.array(chosen, dtype=kept_idx.dtype))
+            extra = rng.choice(remaining, size=quota - len(chosen), replace=False)
+            chosen.extend(extra.tolist())
+        return chosen[:quota]
+
+    if not per_class:
+        return _stratify_pool(np.arange(len(scores)), k)
+
+    classes, counts = np.unique(labels, return_counts=True)
+    class_quota = np.round((counts / len(labels)) * k).astype(int)
+    class_quota[np.argmax(counts)] += k - class_quota.sum()
+
+    selected = []
+    for cls, quota in zip(classes, class_quota):
+        cls_pool = np.where(labels == cls)[0]
+        selected.extend(_stratify_pool(cls_pool, int(quota)))
+    return selected
+
+
 def _run_mrmc_selection(
     model_fn,
     dataset,
@@ -332,6 +429,8 @@ class MRMCOriginalStratifiedCoresetSelection(CoresetSelection):
 def _run_mrmc_kmeans_selection(
     model_fn, dataset, coreset_size, device,
     R, penultimate_layer_name, batch_size, lr,
+    normalize_features=False,
+    alpha=1.0,
 ):
     N = len(dataset)
     model = model_fn()
@@ -366,6 +465,8 @@ def _run_mrmc_kmeans_selection(
     print("Extracting features for K-Means clustering...")
     all_features, _ = _extract_features(model, ordered_loader, device, penultimate_layer_name)
     all_features_np = all_features.numpy()
+    if normalize_features:
+        all_features_np = all_features_np / (np.linalg.norm(all_features_np, axis=1, keepdims=True) + 1e-8)
     all_labels_np = dataset.tensors[1].numpy()
 
     classes, counts = np.unique(all_labels_np, return_counts=True)
@@ -374,6 +475,8 @@ def _run_mrmc_kmeans_selection(
 
     selected = []
     for cls, quota in tqdm(zip(classes, class_quota), total=len(classes), desc="K-Means per class"):
+        if quota == 0:
+            continue
         cls_indices = np.where(all_labels_np == cls)[0]
         cls_features = all_features_np[cls_indices]
         cls_scores = mrmc_scores[cls_indices]
@@ -386,8 +489,20 @@ def _run_mrmc_kmeans_selection(
             mask = cluster_ids == c
             if not mask.any():
                 continue
-            best_local = int(np.argmax(cls_scores[mask]))
-            selected.append(int(cls_indices[np.where(mask)[0][best_local]]))
+            member_indices = np.where(mask)[0]
+            if alpha >= 1.0:
+                best_local = int(np.argmax(cls_scores[mask]))
+            else:
+                dists = np.linalg.norm(cls_features[mask] - km.cluster_centers_[c], axis=1)
+                proximity = 1.0 / (dists + 1e-8)
+
+                mrmc_vals = cls_scores[mask]
+                mrmc_norm = (mrmc_vals - mrmc_vals.min()) / (mrmc_vals.ptp() + 1e-8)
+                prox_norm = (proximity - proximity.min()) / (proximity.ptp() + 1e-8)
+
+                blended = alpha * mrmc_norm + (1.0 - alpha) * prox_norm
+                best_local = int(np.argmax(blended))
+            selected.append(int(cls_indices[member_indices[best_local]]))
 
     return selected
 
@@ -422,6 +537,163 @@ class MRMCKMeansCoresetSelection(CoresetSelection):
             penultimate_layer_name=self.penultimate_layer_name,
             batch_size=self.batch_size,
             lr=self.lr,
+        )
+
+
+class MRMCKMeansNormalizedCoresetSelection(CoresetSelection):
+    """
+    MRMC + K-Means with L2-normalized features before clustering.
+
+    Identical to MRMCKMeansCoresetSelection but normalizes penultimate-layer
+    features to unit length before running MiniBatchKMeans. This prevents
+    high-variance dimensions from dominating cluster assignments and improves
+    diversity when feature magnitudes vary across the dataset.
+    """
+    def __init__(self, coreset_fraction, R, model_fn, device,
+                 penultimate_layer_name=None, batch_size=64, lr=0.001):
+        super().__init__(coreset_fraction)
+        self.R = R
+        self.model_fn = model_fn
+        self.device = device
+        self.penultimate_layer_name = penultimate_layer_name
+        self.batch_size = batch_size
+        self.lr = lr
+
+    def select_coreset(self, dataset):
+        coreset_size = int(self.coreset_fraction * len(dataset))
+        return _run_mrmc_kmeans_selection(
+            model_fn=self.model_fn,
+            dataset=dataset,
+            coreset_size=coreset_size,
+            device=self.device,
+            R=self.R,
+            penultimate_layer_name=self.penultimate_layer_name,
+            batch_size=self.batch_size,
+            lr=self.lr,
+            normalize_features=True,
+        )
+
+
+class MRMCKMeansBlendedCoresetSelection(CoresetSelection):
+    """
+    MRMC + K-Means with a blended per-cluster selection score.
+
+    Within each cluster, selects the sample that maximizes:
+        alpha * norm_mrmc_score + (1 - alpha) * norm_proximity_score
+
+    where proximity = 1 / (distance_to_centroid + eps).
+
+    alpha=1.0  → pure MRMC (same as MRMCKMeansCoresetSelection)
+    alpha=0.0  → pure centroid-closest (maximum representativeness)
+    alpha=0.5  → balanced informativeness + coverage
+
+    Setting alpha < 1 reduces the bias toward hard/borderline samples that
+    causes vanilla MRMC-KMeans to underperform random selection.
+    """
+    def __init__(self, coreset_fraction, R, model_fn, device,
+                 penultimate_layer_name=None, batch_size=64, lr=0.001,
+                 alpha=0.5, normalize_features=True):
+        super().__init__(coreset_fraction)
+        self.R = R
+        self.model_fn = model_fn
+        self.device = device
+        self.penultimate_layer_name = penultimate_layer_name
+        self.batch_size = batch_size
+        self.lr = lr
+        self.alpha = alpha
+        self.normalize_features = normalize_features
+
+    def select_coreset(self, dataset):
+        coreset_size = int(self.coreset_fraction * len(dataset))
+        return _run_mrmc_kmeans_selection(
+            model_fn=self.model_fn,
+            dataset=dataset,
+            coreset_size=coreset_size,
+            device=self.device,
+            R=self.R,
+            penultimate_layer_name=self.penultimate_layer_name,
+            batch_size=self.batch_size,
+            lr=self.lr,
+            normalize_features=self.normalize_features,
+            alpha=self.alpha,
+        )
+
+
+class MRMCScoreStratifiedCoresetSelection(CoresetSelection):
+    """
+    MRMC + CCS-style score-stratified selection.
+
+    Instead of picking the top-k highest MRMC scores (which concentrate on the
+    hardest / most ambiguous samples at aggressive pruning ratios), this bins
+    MRMC scores into equal-population strata and samples uniformly across bins.
+    Combines informativeness (MRMC score signal) with coverage across the
+    difficulty spectrum.
+
+    Addresses the paper's stated limitation that MRMC's optimization term
+    -Σ Δl_j implicitly assumes a constant initial loss across samples — an
+    assumption that breaks on datasets where some samples are inherently
+    easier than others (e.g. MNIST digits 0/1 vs 4/9).
+    """
+    def __init__(self, coreset_fraction, R, model_fn, device,
+                 penultimate_layer_name=None, batch_size=64, lr=0.001,
+                 num_bins=5, prune_bottom=0.1, prune_top=0.0,
+                 per_class=True, seed=0, num_classes=None):
+        super().__init__(coreset_fraction)
+        self.R = R
+        self.model_fn = model_fn
+        self.device = device
+        self.penultimate_layer_name = penultimate_layer_name
+        self.batch_size = batch_size
+        self.lr = lr
+        self.num_bins = num_bins
+        self.prune_bottom = prune_bottom
+        self.prune_top = prune_top
+        self.per_class = per_class
+        self.seed = seed
+        self.num_classes = num_classes
+
+    def select_coreset(self, dataset):
+        N = len(dataset)
+        coreset_size = int(self.coreset_fraction * N)
+
+        model = self.model_fn().to(self.device)
+        criterion = nn.CrossEntropyLoss(reduction='none')
+        optimizer = optim.Adam(model.parameters(), lr=self.lr)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        ordered_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        loss_sequences = np.zeros((N, self.R), dtype=np.float32)
+
+        for r in range(self.R):
+            model.train()
+            for inputs, labels in loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                optimizer.zero_grad()
+                criterion(model(inputs), labels).mean().backward()
+                optimizer.step()
+
+            model.eval()
+            idx = 0
+            with torch.no_grad():
+                for inputs, labels in ordered_loader:
+                    inputs, labels = inputs.to(self.device), labels.to(self.device)
+                    losses = criterion(model(inputs), labels).cpu().numpy()
+                    loss_sequences[idx:idx + len(losses), r] = losses
+                    idx += len(losses)
+            print(f"  Warm-up epoch {r+1}/{self.R}  mean_loss={loss_sequences[:, r].mean():.4f}")
+
+        mrmc_scores = _fit_mrmc_scores(loss_sequences)
+        all_labels_np = dataset.tensors[1].numpy()
+
+        rng = np.random.default_rng(self.seed)
+        return _score_stratified_select(
+            scores=mrmc_scores,
+            labels=all_labels_np,
+            k=coreset_size,
+            num_bins=self.num_bins,
+            prune_bottom=self.prune_bottom,
+            prune_top=self.prune_top,
+            per_class=self.per_class,
+            rng=rng,
         )
 
 

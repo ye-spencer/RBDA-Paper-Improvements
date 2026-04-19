@@ -12,7 +12,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from models import WineMLP
 import torch.nn as nn
 import torch.optim as optim
-from coreset_selection import RandomCoresetSelection, FullDatasetSelection, MRMCOriginalCoresetSelection, MRMCOriginalStratifiedCoresetSelection, MRMCKMeansCoresetSelection, MRMCAdaptiveCoresetSelection
+from coreset_selection import RandomCoresetSelection, FullDatasetSelection, MRMCOriginalCoresetSelection, MRMCOriginalStratifiedCoresetSelection, MRMCKMeansCoresetSelection, MRMCAdaptiveCoresetSelection, MRMCKMeansBlendedCoresetSelection, MRMCScoreStratifiedCoresetSelection
 import time
 
 
@@ -98,7 +98,7 @@ def main():
     ### --- End Find Best Normal ML Hyperparameters for Dataset --- ###
 
     ### Pick Dataset ###
-    DATASET = 'covtype'   # 'digits' | 'mnist' | 'covtype'
+    DATASET = 'mnist'   # 'digits' | 'mnist' | 'covtype'
     X_raw, y_raw = load_dataset(DATASET)
     num_features = X_raw.shape[1]
     num_classes = len(set(y_raw))
@@ -163,6 +163,23 @@ def main():
             model_fn=generate_model_func,
             device=device,
             penultimate_layer_name='fc2',
+        ),
+        MRMCKMeansBlendedCoresetSelection(
+            coreset_fraction, R,
+            model_fn=generate_model_func,
+            device=device,
+            penultimate_layer_name='fc2',
+            alpha=0.5,  # tune this — try 0.0, 0.3, 0.5
+        ),
+        MRMCScoreStratifiedCoresetSelection(
+            coreset_fraction, R,
+            model_fn=generate_model_func,
+            device=device,
+            penultimate_layer_name='fc2',
+            num_bins=5,
+            prune_bottom=0.1,
+            prune_top=0.0,
+            per_class=True,
         ),
         # MRMCAdaptiveCoresetSelection(coreset_fraction, R, rho, gamma, generate_model_func, device),
     ]
