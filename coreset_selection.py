@@ -113,7 +113,7 @@ def _train_proxy(features, labels, num_classes, device, lr=0.01, epochs=10):
     proxy = nn.Linear(feat_dim, num_classes).to(device)
     optimizer = optim.SGD(proxy.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
-    loader = DataLoader(TensorDataset(features, labels), batch_size=256, shuffle=True)
+    loader = DataLoader(TensorDataset(features, labels), batch_size=64, shuffle=True)
     proxy.train()
     for _ in range(epochs):
         for feat, lab in loader:
@@ -183,7 +183,7 @@ def _run_mrmc_selection(
                 bs = len(losses)
                 loss_sequences[idx:idx + bs, r] = losses
                 idx += bs
-        print(f"  Warm-up epoch {r+1}/{R}  mean_loss={loss_sequences[:, r].mean():.4f}")
+        # print(f"  Warm-up epoch {r+1}/{R}  mean_loss={loss_sequences[:, r].mean():.4f}")
 
     # --- Phase 2: MRMC scores ---
     mrmc_scores = _fit_mrmc_scores(loss_sequences)
@@ -422,6 +422,144 @@ class MRMCKMeansCoresetSelection(CoresetSelection):
             penultimate_layer_name=self.penultimate_layer_name,
             batch_size=self.batch_size,
             lr=self.lr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# MRMC + Typicality
+# ---------------------------------------------------------------------------
+
+def _compute_typicality_scores(features_np, labels_np):
+    """
+    Per-sample typicality = exp(-normalized_dist_to_class_centroid).
+
+    Features are z-score normalized per dimension first so that no single
+    feature dominates the distance.  Higher score = more representative of
+    the class cluster (i.e. the sample is near the class mean).
+    """
+    # z-score normalize feature columns
+    mu = features_np.mean(axis=0)
+    sigma = features_np.std(axis=0) + 1e-8
+    normed = (features_np - mu) / sigma
+
+    classes = np.unique(labels_np)
+    typicality = np.zeros(len(labels_np), dtype=np.float32)
+    for cls in classes:
+        mask = labels_np == cls
+        cls_feats = normed[mask]
+        centroid = cls_feats.mean(axis=0)
+        dists = np.linalg.norm(cls_feats - centroid, axis=1)
+        # scale by within-class std so the exponent is unit-free
+        scale = dists.std() + 1e-8
+        typicality[mask] = np.exp(-dists / scale)
+    return typicality
+
+
+def _run_mrmc_typicality_selection(
+    model_fn, dataset, coreset_size, device,
+    R, penultimate_layer_name, batch_size, lr, alpha=0.5,
+):
+    """MRMC warm-up then typicality-weighted stratified selection."""
+    N = len(dataset)
+    model = model_fn()
+    model.to(device)
+
+    criterion = nn.CrossEntropyLoss(reduction='none')
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    ordered_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    loss_sequences = np.zeros((N, R), dtype=np.float32)
+
+    for r in range(R):
+        model.train()
+        for inputs, labels in loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            criterion(model(inputs), labels).mean().backward()
+            optimizer.step()
+
+        model.eval()
+        idx = 0
+        with torch.no_grad():
+            for inputs, labels in ordered_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                losses = criterion(model(inputs), labels).cpu().numpy()
+                loss_sequences[idx:idx + len(losses), r] = losses
+                idx += len(losses)
+        print(f"  Warm-up epoch {r+1}/{R}  mean_loss={loss_sequences[:, r].mean():.4f}")
+
+    mrmc_scores = _fit_mrmc_scores(loss_sequences)
+
+    print("Extracting features for typicality scoring...")
+    all_features, _ = _extract_features(model, ordered_loader, device, penultimate_layer_name)
+    all_features_np = all_features.numpy()
+    all_labels_np = dataset.tensors[1].numpy()
+
+    typicality_scores = _compute_typicality_scores(all_features_np, all_labels_np)
+
+    def _norm01(s):
+        lo, hi = s.min(), s.max()
+        return (s - lo) / (hi - lo + 1e-8)
+
+    # Multiply informativeness by typicality^alpha.
+    # alpha=0 → pure MRMC; alpha=1 → equal geometric weight on both.
+    combined = _norm01(mrmc_scores) * (_norm01(typicality_scores) ** alpha)
+
+    return _stratified_top_k(combined, all_labels_np, coreset_size)
+
+
+class MRMCTypicalityCoresetSelection(CoresetSelection):
+    """
+    MRMC + Typicality coreset selection.
+
+    Uses the same learning-dynamics warm-up as vanilla MRMC, but re-weights
+    each sample's score by how *typical* it is of its class in penultimate-layer
+    feature space:
+
+        score_i = norm(mrmc_i) * norm(typicality_i)^alpha
+
+    where typicality_i = exp(-dist_to_class_centroid / within_class_std).
+
+    Motivation for reducing overfitting
+    ------------------------------------
+    Vanilla MRMC preferentially selects the hardest samples.  Many of those
+    samples are hard because they are outliers or carry noisy labels — not
+    because they lie near a meaningful decision boundary.  Training on such
+    samples causes the model to memorize noise rather than learn structure.
+
+    By down-weighting atypical hard samples we steer selection toward samples
+    that are *informative and representative*, reducing the chance of fitting
+    to edge-case noise while retaining the benefit of difficulty-based scoring.
+
+    Args:
+        alpha: typicality exponent in [0, 1].
+               0 → pure MRMC (no typicality penalty).
+               1 → equal multiplicative weight on MRMC and typicality.
+               Default 0.5 balances informativeness and representativeness.
+    """
+    def __init__(self, coreset_fraction, R, model_fn, device,
+                 penultimate_layer_name=None, batch_size=64, lr=0.001, alpha=0.5):
+        super().__init__(coreset_fraction)
+        self.R = R
+        self.model_fn = model_fn
+        self.device = device
+        self.penultimate_layer_name = penultimate_layer_name
+        self.batch_size = batch_size
+        self.lr = lr
+        self.alpha = alpha
+
+    def select_coreset(self, dataset):
+        coreset_size = int(self.coreset_fraction * len(dataset))
+        return _run_mrmc_typicality_selection(
+            model_fn=self.model_fn,
+            dataset=dataset,
+            coreset_size=coreset_size,
+            device=self.device,
+            R=self.R,
+            penultimate_layer_name=self.penultimate_layer_name,
+            batch_size=self.batch_size,
+            lr=self.lr,
+            alpha=self.alpha,
         )
 
 
